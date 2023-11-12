@@ -14,6 +14,8 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { PausableUpgradeable } from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import { ReentrancyGuardUpgradeable } from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 
+import { console2 } from "forge-std/console2.sol";
+
 /// @title LRTDepositPool - Deposit Pool Contract for LSTs
 /// @notice Handles LST asset deposits
 contract LRTDepositPool is ILRTDepositPool, LRTConfigRoleChecker, PausableUpgradeable, ReentrancyGuardUpgradeable {
@@ -53,6 +55,7 @@ contract LRTDepositPool is ILRTDepositPool, LRTConfigRoleChecker, PausableUpgrad
     /// @notice gets the current limit of asset deposit
     /// @param asset Asset address
     /// @return currentLimit Current limit of asset deposit
+    // @audit will it return corret amount if the limit is updated?
     function getAssetCurrentLimit(address asset) public view override returns (uint256) {
         return lrtConfig.depositLimitByAsset(asset) - getTotalAssetDeposits(asset);
     }
@@ -106,6 +109,8 @@ contract LRTDepositPool is ILRTDepositPool, LRTConfigRoleChecker, PausableUpgrad
         ILRTOracle lrtOracle = ILRTOracle(lrtOracleAddress);
 
         // calculate rseth amount to mint based on asset amount and asset exchange rate
+        // @audit what if the tokens has different decimals?
+
         rsethAmountToMint = (amount * lrtOracle.getAssetPrice(asset)) / lrtOracle.getRSETHPrice();
     }
 
@@ -159,8 +164,10 @@ contract LRTDepositPool is ILRTDepositPool, LRTConfigRoleChecker, PausableUpgrad
     /// @notice add new node delegator contract addresses
     /// @dev only callable by LRT manager
     /// @param nodeDelegatorContracts Array of NodeDelegator contract addresses
+    // @audit is i possible to add duplicates?
     function addNodeDelegatorContractToQueue(address[] calldata nodeDelegatorContracts) external onlyLRTAdmin {
         uint256 length = nodeDelegatorContracts.length;
+
         if (nodeDelegatorQueue.length + length > maxNodeDelegatorCount) {
             revert MaximumNodeDelegatorCountReached();
         }
@@ -199,6 +206,7 @@ contract LRTDepositPool is ILRTDepositPool, LRTConfigRoleChecker, PausableUpgrad
     /// @notice update max node delegator count
     /// @dev only callable by LRT admin
     /// @param maxNodeDelegatorCount_ Maximum count of node delegator
+    // @audit should check the number of node delegators in the queue
     function updateMaxNodeDelegatorCount(uint256 maxNodeDelegatorCount_) external onlyLRTAdmin {
         maxNodeDelegatorCount = maxNodeDelegatorCount_;
         emit MaxNodeDelegatorCountUpdated(maxNodeDelegatorCount);

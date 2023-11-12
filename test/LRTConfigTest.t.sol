@@ -6,11 +6,16 @@ import { BaseTest, MockToken } from "./BaseTest.t.sol";
 import { LRTConfig, ILRTConfig } from "src/LRTConfig.sol";
 import { LRTConstants } from "src/utils/LRTConstants.sol";
 import { UtilLib } from "src/utils/UtilLib.sol";
-import { TransparentUpgradeableProxy } from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
+import {
+    TransparentUpgradeableProxy,
+    ITransparentUpgradeableProxy
+} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 import { ProxyAdmin } from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+import { console2 } from "forge-std/console2.sol";
 
 contract LRTConfigTest is BaseTest {
     LRTConfig public lrtConfig;
+    TransparentUpgradeableProxy lrtConfigProxy;
 
     event AssetDepositLimitUpdate(address asset, uint256 depositLimit);
     event RemovedSupportedAsset(address asset);
@@ -26,7 +31,7 @@ contract LRTConfigTest is BaseTest {
 
         ProxyAdmin proxyAdmin = new ProxyAdmin();
         LRTConfig lrtConfigImpl = new LRTConfig();
-        TransparentUpgradeableProxy lrtConfigProxy = new TransparentUpgradeableProxy(
+        lrtConfigProxy = new TransparentUpgradeableProxy(
             address(lrtConfigImpl),
             address(proxyAdmin),
             ""
@@ -187,6 +192,26 @@ contract LRTConfigUpdateAssetDepositLimitTest is LRTConfigTest {
         assertEq(lrtConfig.depositLimitByAsset(address(stETH)), depositLimit);
         assertEq(lrtConfig.depositLimitByAsset(address(rETH)), depositLimit);
         assertEq(lrtConfig.depositLimitByAsset(address(cbETH)), depositLimit);
+    }
+
+    // @audit passed
+    function test_UpdateAssetDepositLimitToLessThanPreviousLimit() external {
+        // getting the old limit for cbETH
+        uint256 oldDepositLimitShouldBe = 100_000 ether; // 100k
+        uint256 oldDepositLimit = lrtConfig.depositLimitByAsset(address(cbETH));
+
+        assertEq(oldDepositLimit, oldDepositLimitShouldBe);
+
+        // setting new limit less by 10_000 ether
+        uint256 newDepositLimit = oldDepositLimit - 10_000 ether;
+
+        // updating the limit
+        vm.startPrank(manager);
+        lrtConfig.updateAssetDepositLimit(address(cbETH), newDepositLimit);
+        vm.stopPrank();
+
+        // checking the new limit
+        assertEq(lrtConfig.depositLimitByAsset(address(cbETH)), newDepositLimit);
     }
 }
 
@@ -393,5 +418,18 @@ contract LRTConfigSettersTest is LRTConfigTest {
         vm.stopPrank();
 
         assertEq(lrtConfig.contractMap(LRTConstants.LRT_ORACLE), newContract);
+    }
+
+    function test_LRTConfigCannotBeUpgraded() public {
+        LRTConfig newLRTConfig = new LRTConfig();
+
+        vm.startPrank(admin);
+
+        vm.expectRevert();
+        (bool success,) = address(lrtConfigProxy).call(
+            abi.encodeWithSelector(ITransparentUpgradeableProxy.upgradeTo.selector, address(newLRTConfig))
+        );
+
+        require(success, "call failed");
     }
 }

@@ -6,9 +6,11 @@ import { BaseTest } from "./BaseTest.t.sol";
 import { LRTDepositPool } from "src/LRTDepositPool.sol";
 import { RSETHTest, ILRTConfig, UtilLib, LRTConstants } from "./RSETHTest.t.sol";
 import { ILRTDepositPool } from "src/interfaces/ILRTDepositPool.sol";
+import {NodeDelegator} from "../src/NodeDelegator.sol";
 
 import { TransparentUpgradeableProxy } from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 import { ProxyAdmin } from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+import {console2} from "forge-std/console2.sol";
 
 contract LRTOracleMock {
     function getAssetPrice(address) external pure returns (uint256) {
@@ -126,6 +128,8 @@ contract LRTDepositPoolDepositAsset is LRTDepositPoolTest {
         assertGt(aliceBalanceAfter, aliceBalanceBefore, "Alice balance is not set");
     }
 
+    // @audit not proper fuzzing
+
     function test_FuzzDepositAsset(uint256 amountDeposited) external {
         uint256 stETHDepositLimit = lrtConfig.depositLimitByAsset(address(stETH));
         vm.assume(amountDeposited > 0 && amountDeposited <= stETHDepositLimit);
@@ -214,6 +218,28 @@ contract LRTDepositPoolGetAssetCurrentLimit is LRTDepositPoolTest {
         vm.stopPrank();
 
         assertEq(lrtDepositPool.getAssetCurrentLimit(address(stETH)), 4 ether, "Asset current limit is not set");
+    }
+
+    // @audit test passed
+    function test_ChaningAssetDepositLimitWhenAssetHasBeenDeposited() external {
+        vm.startPrank(manager);
+        lrtConfig.updateAssetDepositLimit(address(stETH), 10 ether);
+        vm.stopPrank();
+
+        // deposit 1 ether stETH
+        vm.startPrank(alice);
+        stETH.approve(address(lrtDepositPool), 6 ether);
+        lrtDepositPool.depositAsset(address(stETH), 6 ether);
+        vm.stopPrank();
+
+        assertEq(lrtDepositPool.getAssetCurrentLimit(address(stETH)), 4 ether, "Asset current limit is not set");
+
+        vm.startPrank(manager);
+        lrtConfig.updateAssetDepositLimit(address(stETH), 1 ether);
+        vm.stopPrank();
+
+        vm.expectRevert();
+        lrtDepositPool.getAssetCurrentLimit(address(stETH));
     }
 }
 
@@ -494,6 +520,62 @@ contract LRTDepositPoolUpdateMaxNodeDelegatorCount is LRTDepositPoolTest {
         vm.stopPrank();
 
         assertEq(lrtDepositPool.maxNodeDelegatorCount(), 10, "Max node delegator count is not set");
+    }
+
+    // @audit test passed
+    function test_LenghtOfDelegatorsQueueCanExceedMaxDelegatorCountIfChangedAndCanCauseDoS() external {
+        // adding 10 delegators to queue which is the current max delegator limit
+        console2.log("current delegators count:  %s", lrtDepositPool.getNodeDelegatorQueue().length);
+
+        address[] memory nodeDelegatorAddresses = new address[](10);
+        for (uint256 i; i < 10; i++) {
+            nodeDelegatorAddresses[i] = makeAddr(string(abi.encodePacked("nodeDelegator", i)));
+        }
+
+        console2.log("adding 10 delegators to queue");
+        vm.startPrank(admin);
+        lrtDepositPool.addNodeDelegatorContractToQueue(nodeDelegatorAddresses);
+
+        console2.log("new delegators count: %s", lrtDepositPool.getNodeDelegatorQueue().length);
+
+        console2.log("UpdatingMaxNodeDelegatorCount to 5");
+        lrtDepositPool.updateMaxNodeDelegatorCount(5);
+        vm.stopPrank();
+
+        assertEq(lrtDepositPool.maxNodeDelegatorCount(), 5, "Max node delegator count is not set");
+
+
+
+        console2.log("\ncurrent delegators | max delegators");
+        console2.log("%s               | %s", lrtDepositPool.getNodeDelegatorQueue().length, lrtDepositPool.maxNodeDelegatorCount());
+
+        // length of currently added delegators in more that the max delegators count
+        assertGt(lrtDepositPool.getNodeDelegatorQueue().length, 5, "Node delegator is not added");
+
+        nodeDelegatorAddresses = new address[](10);
+        nodeDelegatorAddresses[0] = makeAddr("nodeDelegator11");
+        // adding more delegators will revert now
+        vm.expectRevert();
+        vm.prank(admin);
+        lrtDepositPool.addNodeDelegatorContractToQueue(nodeDelegatorAddresses);
+    }
+
+    // @audit test passed
+    function test_SameDelegatorCanBeAddedMoreThanOnce() public {
+        address delegatorAddress = address(new NodeDelegator());
+        // initializing node delegator
+        // NodeDelegator(delegatorAddress).initialize(address(lrtConfig));
+
+        address[] memory nodeDelegatorAddresses = new address[](1);
+        nodeDelegatorAddresses[0] = delegatorAddress;
+
+        vm.startPrank(admin);
+        lrtDepositPool.addNodeDelegatorContractToQueue(nodeDelegatorAddresses);
+        lrtDepositPool.addNodeDelegatorContractToQueue(nodeDelegatorAddresses);
+        vm.stopPrank();
+
+        // checking length of the delegators
+        assertEq(lrtDepositPool.getNodeDelegatorQueue().length, 2, "Node delegator is not added");
     }
 }
 
