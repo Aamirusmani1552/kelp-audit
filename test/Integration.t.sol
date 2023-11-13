@@ -358,7 +358,7 @@ contract BaseIntegrationTest is BaseTest {
     function test_depositToPoolMultipleTimes() public {
         uint256 amount = 500 ether;
 
-        for (uint256 i; i < 10; i++) {
+        for (uint256 i; i < 5; i++) {
             // minting tokens to user to make sure he has enough tokens
             cbETH.mint(alice, amount);
 

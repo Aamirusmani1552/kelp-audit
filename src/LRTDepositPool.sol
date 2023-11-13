@@ -60,6 +60,27 @@ contract LRTDepositPool is ILRTDepositPool, LRTConfigRoleChecker, PausableUpgrad
         return lrtConfig.depositLimitByAsset(asset) - getTotalAssetDeposits(asset);
     }
 
+    // @audit what if different tokens have different eth conversion rate
+    // function getAssetDistributionData(address asset)
+    //     public
+    //     view
+    //     override
+    //     onlySupportedAsset(asset)
+    //     returns (uint256 assetLyingInDepositPool, uint256 assetLyingInNDCs, uint256 assetStakedInEigenLayer)
+    // {
+    //     // Question: is here the right place to have this? Could it be in LRTConfig?
+    //     assetLyingInDepositPool = IERC20(asset).balanceOf(address(this));
+
+    //     uint256 ndcsCount = nodeDelegatorQueue.length;
+    //     for (uint256 i; i < ndcsCount;) {
+    //         assetLyingInNDCs += IERC20(asset).balanceOf(nodeDelegatorQueue[i]);
+    //         assetStakedInEigenLayer += INodeDelegator(nodeDelegatorQueue[i]).getAssetBalance(asset);
+    //         unchecked {
+    //             ++i;
+    //         }
+    //     }
+    // }
+
     /// @dev get node delegator queue
     /// @return nodeDelegatorQueue Array of node delegator contract addresses
     function getNodeDelegatorQueue() external view override returns (address[] memory) {

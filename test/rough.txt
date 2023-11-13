@@ -367,3 +367,108 @@ As you can see when duplicate address is there the amount of token received was 
 ## Tools Used
 
 ## Recommended Mitigation Steps
+
+Users will receive less `RSETH` tokens when depositing into the contract using `LRTDepositPool::deposit(...)`. The function transfers the deposit tokens to itself and then makes calculation for the amount of `RSETH` to be minted for the user. Because of this the users will get less tokens then actual amount.
+
+## Impact
+The `LRTDepositPool::deposit(...)` function makes call to different functions from the same contract that again calls other contracts to calculate the amount of token to mint for the user. Here is a high level flow:
+
+```
+LRTDepositPool::deposit()
+           |_ LRTDepositPool::_mintRsETH() 
+                      |_ LRTDepositPool::getRsETHAmountToMint() 
+                                |_ LRTOracle::getAssetPrice()
+                                |_ LRTOracle::getRSETHPrice()
+                                            |_ LRTOracle::getSupportedAssetList()
+                                            |_ LRTOracle::getAssetPrice()
+                                            |_ LRTDepositPool::getTotalAssetDeposits()
+@>                                                          |_ LRTDepositPool::getAssetDistributionData()
+                                                                   |_ NodeDelegator::getAssetBalance()
+```
+
+This function makes a call to `LRTDepositPool::getAssetDistributionData()`(indirectly) to fetch the total amount of tokens deposited in `LRTDepositPool`, `NodeDelegator` and Eigen Layer strategies. To fetch the assets deposited in `LRTDepositPool` this `LRTDepositPool::getAssetDistributionData()` function perform the following operation:
+
+```Javascript
+        assetLyingInDepositPool = IERC20(asset).balanceOf(address(this));
+```
+
+This just reads the balance of the `asset` that `LRTDepositPool` has. Now the problem is, when user calls `LRTDepositPool::deposit()`, this function first transfer the tokens to itself and then calls `_mintRsETH()` to calculate the amount of `RSETH` to mint to the user. 
+
+```Javascript
+    function depositAsset(
+        address asset,
+        uint256 depositAmount
+    )
+        external
+        whenNotPaused
+        nonReentrant
+        onlySupportedAsset(asset)
+    {
+        // checks
+        if (depositAmount == 0) {
+            revert InvalidAmount();
+        }
+        if (depositAmount > getAssetCurrentLimit(asset)) {
+            revert MaximumDepositLimitReached();
+        }
+
+        // this will increase the balance before any calculation
+@>        if (!IERC20(asset).transferFrom(msg.sender, address(this), depositAmount)) {
+            revert TokenTransferFailed();
+        }
+
+        // interactions
+@>        uint256 rsethAmountMinted = _mintRsETH(asset, depositAmount);
+
+        emit AssetDeposit(asset, depositAmount, rsethAmountMinted);
+    }
+ ```
+
+But when a call reaches to `LRTDepositPool::getAssetDistributionData()`, the function calculate the `assetLyingInDepositPool` using the above operation that just reads the balance of token that is stored in `LRTDepositPool` using `ERC20::balanceOf()` function. But this balance now also stores the newly added tokens as they were transferred to this contract in the beginning. That means the data in `assetLyingInDepositPool` will be more than the original amount. 
+This amount will be returned back to `LRTOracle::getRSETHPrice()` after going through some other functions that will add this amount to balance of `token` stored in `NodeDelegator` and Eigen Layer strategies.
+
+```Javascript
+    function getRSETHPrice() external view returns (uint256 rsETHPrice) {
+        address rsETHTokenAddress = lrtConfig.rsETH();
+        uint256 rsEthSupply = IRSETH(rsETHTokenAddress).totalSupply();
+
+        if (rsEthSupply == 0) {
+            return 1 ether;
+        }
+
+        uint256 totalETHInPool;
+        address lrtDepositPoolAddr = lrtConfig.getContract(LRTConstants.LRT_DEPOSIT_POOL);
+
+        address[] memory supportedAssets = lrtConfig.getSupportedAssetList();
+        uint256 supportedAssetCount = supportedAssets.length;
+
+        for (uint16 asset_idx; asset_idx < supportedAssetCount;) {
+            address asset = supportedAssets[asset_idx];
+            uint256 assetER = getAssetPrice(asset);
+
+@>            uint256 totalAssetAmt = ILRTDepositPool(lrtDepositPoolAddr).getTotalAssetDeposits(asset);
+            totalETHInPool += totalAssetAmt * assetER;
+
+            unchecked {
+                ++asset_idx;
+            }
+        }
+
+        // expensive?
+        return totalETHInPool / rsEthSupply;
+    }
+```
+
+This `totalAssetAmt` contains all amount of a token that is stored in different contracts that also includes the newly deposited amount. Then this amount will be multiplied with corresponding ETH price feed and will be stored in `totalETHInPool`. Now when the `RSETH` price is returned from the function it will be in ration of total eth deposited in pools to total supply of `RSETH`. And since the `RSETH` supply will be less than the total deposits of eth stored in `totalETHInPool` because the corresponding `RSETH` has not been minted yet. the ratio returned will be more than expected. This ratio will increase if the `amount` provided to `LRTDepositPool::deposit(...)` is increased.
+
+Now this ratio will be returned to the `LRTDepositPool::getRsETHAmountToMint()` 
+
+ The amount that `LRTOracle::getRSETHPrice()`
+This data will be returned back to `LRTDepositPool::getRsETHAmountToMint()` function that will calculate the amount of `RSETH` token to mint. 
+
+## Proof of Concept
+Provide direct links to all referenced code in GitHub. Add screenshots, logs, or any other relevant proof that illustrates the concept.
+
+## Tools Used
+
+## Recommended Mitigation Steps
