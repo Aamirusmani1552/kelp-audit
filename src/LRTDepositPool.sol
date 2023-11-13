@@ -138,6 +138,7 @@ contract LRTDepositPool is ILRTDepositPool, LRTConfigRoleChecker, PausableUpgrad
             revert MaximumDepositLimitReached();
         }
 
+        // this will increase the balance before any calculation
         if (!IERC20(asset).transferFrom(msg.sender, address(this), depositAmount)) {
             revert TokenTransferFailed();
         }

@@ -7,6 +7,7 @@ import { LRTConstants } from "./LRTConstants.sol";
 import { ILRTConfig } from "../interfaces/ILRTConfig.sol";
 
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+import { console2 } from "forge-std/console2.sol";
 
 /// @title LRTConfigRoleChecker - LRT Config Role Checker Contract
 /// @notice Handles LRT config role checks

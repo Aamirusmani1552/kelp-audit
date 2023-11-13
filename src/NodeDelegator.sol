@@ -13,6 +13,8 @@ import { IERC20 } from "@openzeppelin/contracts/interfaces/IERC20.sol";
 import { PausableUpgradeable } from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import { ReentrancyGuardUpgradeable } from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 
+import { console2 } from "forge-std/console2.sol";
+
 /// @title NodeDelegator Contract
 /// @notice The contract that handles the depositing of assets into strategies
 contract NodeDelegator is INodeDelegator, LRTConfigRoleChecker, PausableUpgradeable, ReentrancyGuardUpgradeable {
@@ -27,8 +29,8 @@ contract NodeDelegator is INodeDelegator, LRTConfigRoleChecker, PausableUpgradea
         UtilLib.checkNonZeroAddress(lrtConfigAddr);
         __Pausable_init();
         __ReentrancyGuard_init();
-
         lrtConfig = ILRTConfig(lrtConfigAddr);
+
         emit UpdatedLRTConfig(lrtConfigAddr);
     }
 

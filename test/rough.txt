@@ -1,0 +1,369 @@
+alice = 1000 cbETH
+bob = 1000 cbETH
+LRTDepositPool = 0 cbETH
+rsETHTotalSupply = 0
+totalETHInPool = 0
+
+////////////////////
+// first deposit ///
+////////////////////
+
+depositAmount = 500 cbETH
+alice = 500 cbETH
+bob = 1000 cbETH
+LRTDepositPool = 500 cbETH
+cbETHPrice = 1e18
+totalETHInPool = 500 cbETH
+
+rsETHPrice = if -> (supply = 0) 1 ETH -> True -> 1 ETH
+             else -> totalETHInPool / rsETHTotalSupply
+
+rsEthAmountToMint = depositAmount * cbETHPrice / rsETHPrice
+                  = 500 * 1e18 / 1e18 = 500 rsETH
+rsETHTotalSupply = 500 rsETH
+
+
+////////////////////
+// second deposit //
+////////////////////
+
+depositAmount = 500 cbETH
+alice = 500 cbETH
+bob = 500 cbETH
+LRTDepositPool = 1000 cbETH
+cbETHPrice = 1e18
+totalETHInPool = 1000 cbETH (updated before calculating rsETHPrice)
+
+rsETHPrice = if -> (supply = 500) 1 ETH
+             else -> totalETHInPool / rsETHTotalSupply -> True -> 1000 / 500 = 2 ETH
+rsEthAmountToMint = depositAmount * cbETHPrice / rsETHPrice
+                  = 500 * 1e18 / 2e18 = 250 rsETH
+
+rsETHTotalSupply = 500 + 250 = 750 rsETH
+
+
+////////////////////
+// third deposit ///
+////////////////////
+depositAmount = 500 cbETH
+alice = 500 cbETH
+bob = 0 cbETH
+LRTDepositPool = 1500 cbETH
+cbETHPrice = 1e18
+totalETHInPool = 1500 cbETH (updated before calculating rsETHPrice)
+
+rsETHPrice = if -> (supply = 750) 1 ETH
+             else -> totalETHInPool / rsETHTotalSupply -> True -> 1500 / 750 = 2 ETH
+rsEthAmountToMint = depositAmount * cbETHPrice / rsETHPrice
+                  = 500 * 1e18 / 2e18 = 250 rsETH
+
+rsETHTotalSupply = 750 + 250 = 1000 rsETH
+
+
+////////////////////
+// fourth deposit //
+////////////////////
+depositAmount = 500 cbETH
+alice = 0 cbETH
+bob = 0 cbETH
+LRTDepositPool = 2000 cbETH
+cbETHPrice = 1e18
+totalETHInPool = 2000 cbETH (updated before calculating rsETHPrice)
+
+rsETHPrice = if -> (supply = 1000) 1 ETH
+             else -> totalETHInPool / rsETHTotalSupply -> True -> 2000 / 1000 = 2 ETH
+
+rsEthAmountToMint = depositAmount * cbETHPrice / rsETHPrice
+                  = 500 * 1e18 / 2e18 = 250 rsETH
+
+rsETHTotalSupply = 1000 + 250 = 1250 rsETH
+
+
+This is a potential issue as the user will get less rsETH than expected.
+
+
+// @audit What about rebasing tokens?
+// @audit what about erc777 tokens? would they work 
+
+
+There is no check in `LRTDepositPool::addNodeDelegatorContractToQueue(...)` that checks for the duplicate address of the `NodeDelegator`. If same address is added more than once then the price oracles and corresponding functions will give wrong price info and less tokens will be minted to the user because of double calculation of the deposited Amount.
+
+## Impact
+`LRTDepositPool::addNodeDelegatorContractToQueue(...)` function does not check if the already added `NodeDelegator` address has been sent to the function. If the same address is sent mistakenly then it will be added to the node delegator queue. And there is no way now to remove this duplicate address from the queue. 
+This delegator queue directly affects the calculation of tokens to mint. This is how:
+
+When user calls `LRTDepositPool::depositAsset(...)` function, this function makes a call to `LRTDepositPool::_mintRsETH(...)` function. This function mints the amount of `RSETH` that user should receive for his deposit. To calculate the amount of `RSETH` to mint, this function calls `LRTDepositPool::getRsETHAmountToMint(...)`. Then a call will be made to `LRTOracle::getRSETHPrice()` to get the `RSETH` price for further calculation:
+
+```Javascript
+    function getRsETHAmountToMint(
+        address asset,
+        uint256 amount
+    )
+        public
+        view
+        override
+        returns (uint256 rsethAmountToMint)
+    {
+        // setup oracle contract
+        address lrtOracleAddress = lrtConfig.getContract(LRTConstants.LRT_ORACLE);
+        ILRTOracle lrtOracle = ILRTOracle(lrtOracleAddress);
+
+        // calculate rseth amount to mint based on asset amount and asset exchange rate
+        // @audit what if the tokens has different decimals?
+
+@>        rsethAmountToMint = (amount * lrtOracle.getAssetPrice(asset)) / lrtOracle.getRSETHPrice();
+    }
+```
+
+This function again takes help of few other function to make the calculation. This is the function that will cause the problem:
+
+```Javascript
+    function getAssetDistributionData(address asset)
+        public
+        view
+        override
+        onlySupportedAsset(asset)
+        returns (uint256 assetLyingInDepositPool, uint256 assetLyingInNDCs, uint256 assetStakedInEigenLayer)
+    {
+        // Question: is here the right place to have this? Could it be in LRTConfig?
+        assetLyingInDepositPool = IERC20(asset).balanceOf(address(this));
+
+@>        uint256 ndcsCount = nodeDelegatorQueue.length;
+        for (uint256 i; i < ndcsCount;) {
+            assetLyingInNDCs += IERC20(asset).balanceOf(nodeDelegatorQueue[i]);
+            assetStakedInEigenLayer += INodeDelegator(nodeDelegatorQueue[i]).getAssetBalance(asset);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+```
+
+This `LRTDepositPool::getAssetDistributionData(...)` fucntion as you can see counts the amount of assets deposited in both `NodeDelegator` contracts and `Eigen Layer Strategies`. It first fetches the `nodeDelegatorQueue` and try looping through each `NodeDelegator` contract to get the amount of tokens deposited and adds it to `assetLyingInNDCs` and `assetStakedInEigenLayer`. But if there is a duplicate address in the queue then the same deposit value will be added twice and returned value will be more than the original.
+
+Now when this amount is returned back to the `LRTOracle::getRSETHPrice(...)` after some other calculation by other functions, the combined amount returned will be multiplied by it's corresponding ETH price and will be added to `totalETHInPool`. 
+
+```Javascript
+    function getRSETHPrice() external view returns (uint256 rsETHPrice) {
+        address rsETHTokenAddress = lrtConfig.rsETH();
+        uint256 rsEthSupply = IRSETH(rsETHTokenAddress).totalSupply();
+
+        if (rsEthSupply == 0) {
+            return 1 ether;
+        }
+
+        uint256 totalETHInPool;
+        address lrtDepositPoolAddr = lrtConfig.getContract(LRTConstants.LRT_DEPOSIT_POOL);
+
+        address[] memory supportedAssets = lrtConfig.getSupportedAssetList();
+        uint256 supportedAssetCount = supportedAssets.length;
+
+        for (uint16 asset_idx; asset_idx < supportedAssetCount;) {
+            address asset = supportedAssets[asset_idx];
+            uint256 assetER = getAssetPrice(asset);
+
+            uint256 totalAssetAmt = ILRTDepositPool(lrtDepositPoolAddr).getTotalAssetDeposits(asset);
+ @>           totalETHInPool += totalAssetAmt * assetER;
+
+            unchecked {
+                ++asset_idx;
+            }
+        }
+        // @audit can we manipulate the price and get more rsEth? or can we manipulate the price and make the rsEth more
+        // expensive?
+        return totalETHInPool / rsEthSupply;
+    }
+```
+
+Now this `totalETHInPool` variables hold wrong data that is more than the orginal. When this function reaches to return statement it will return wrong ratio. And this ratio will be returned back to `LRTDepositPool::getRsETHAmountToMint(...)`
+
+```Javascript
+        return totalETHInPool / rsEthSupply;
+```
+
+`LRTDepositPool::getRsETHAmountToMint(...)` function performs the following calculation to calculate the amount of RSETH to mint:
+
+```Javascript
+        rsethAmountToMint = (amount * lrtOracle.getAssetPrice(asset)) / lrtOracle.getRSETHPrice();
+```
+
+since the value returned from the `LRTOracle::getRSETHPrice(...)` is in the denominator, the amount to mint will be less as the price is more than the original. For example:
+
+```
+amount = 10 cbETH
+cbETHPrice = 1 ETH (denoted by `lrtOracle.getAssetPrice(asset)` in the above calculation)
+rsETHPrice = 1 ETH (denoted by `lrtOracle.getRSETHPrice()` in the above calculation)
+
+rsethAmountToMint  = 10e18 * 1e18 / 1e18
+                   = 10e18
+
+--> When rsETHPrice = 1.1 ETH
+rsethAmountToMint  = 10e18 * 1e18 / 1.1e18
+                   = 9.09e18 approx
+```
+
+Hence the wrong info will be returned to the mint function and user will receive less tokens.
+
+## Proof of Concept
+#### Tests that proves that:
+
+_When Duplicate `NodeDelegator` has been added_
+
+```Javascript
+    function test_SameNodeDelegatorsCanBeAddedTwiceThatWillGiveIncorrectData() public {
+        // adding some tokens to the pool
+        uint256 amount = 500 ether;
+        vm.prank(alice);
+        uint256 amountOfRSETHMintedToAlice = depositAssetToPool(address(cbETH), amount, alice, 1);
+
+        // transferring rewards to node delegator
+        // necessary to make the situation work.
+        vm.prank(manager);
+        lrtDepositPoolP.transferAssetToNodeDelegator(0, address(cbETH), amount);
+
+        // adding same node delegator again
+        address[] memory nodeDelegatorAddresses = new address[](1);
+        nodeDelegatorAddresses[0] = address(nodeDelP);
+
+        vm.startPrank(admin);
+        lrtDepositPoolP.addNodeDelegatorContractToQueue(nodeDelegatorAddresses);
+        vm.stopPrank();
+
+        // checking if node delegator is added
+        address[] memory addedAddresses = lrtDepositPoolP.getNodeDelegatorQueue();
+        assertEq(addedAddresses.length, 2, "length is not same");
+
+        // checking if node delegator addresses are same
+        for (uint8 i; i < addedAddresses.length; i++) {
+            assertEq(addedAddresses[i], address(nodeDelP), "addresses are not same");
+        }
+
+        console2.log("Amount To Deposit: %s", amount);
+        uint256 tokenToRSETHAmount = lrtDepositPoolP.getRsETHAmountToMint(address(cbETH), amount);
+        console2.log("Amount of RSETH Tokens to Recieve: %s", tokenToRSETHAmount);
+
+        // depositing again to check how many we will receive
+        amountOfRSETHMintedToAlice = depositAssetToPool(address(cbETH), amount, alice, 2);
+        console2.log("Amount of token Received After Deposit: %s", amountOfRSETHMintedToAlice);
+
+        // can't do this because of another vulnerability in the code
+        // assertEq(amountOfRSETHMintedToAlice, tokenToRSETHAmount, "amount is not same");
+    }
+```
+
+*Output:*
+
+```bash
+[PASS] test_SameNodeDelegatorsCanBeAddedTwiceThatWillGiveIncorrectData() (gas: 588582)
+Logs:
+
+
+  ------------------------ Run 1:  Deposit Info  ------------------------
+
+  Deposit Amount: 500000000000000000000
+  LRTDepositPool Balance Before Deposit: 0
+  LRTDepositPool Balance After Deposit: 500000000000000000000
+  Change in Balance of LRTDepositPool: 500000000000000000000
+  RSETH Minted to User: 500000000000000000000
+  TotalSupply of RSETH: 500000000000000000000
+
+  ------------------------------------------------------------------------
+
+  Amount To Deposit: 500000000000000000000
+  Amount of RSETH Tokens to Recieve: 250000000000000000000
+
+
+  ------------------------ Run 2:  Deposit Info  ------------------------
+
+  Deposit Amount: 500000000000000000000
+  LRTDepositPool Balance Before Deposit: 0
+  LRTDepositPool Balance After Deposit: 500000000000000000000
+  Change in Balance of LRTDepositPool: 500000000000000000000
+  RSETH Minted to User: 166666666666666666666
+  TotalSupply of RSETH: 666666666666666666666
+
+  ------------------------------------------------------------------------
+
+  Amount of token Received After Deposit: 166666666666666666666
+
+Test result: ok. 1 passed; 0 failed; 0 skipped; finished in 8.15ms
+
+Ran 1 test suites: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+PS E:\kelp-audit> 
+
+```
+
+_When no Duplicate `NodeDelegator` is added_
+
+```Javascript
+    function test_SameTestAsAboveWithoutAddingDuplicateNodeDelegator() public {
+        // adding some tokens to the pool
+        uint256 amount = 500 ether;
+        vm.prank(alice);
+        uint256 amountOfRSETHMintedToAlice = depositAssetToPool(address(cbETH), amount, alice, 1);
+
+        // transferring rewards to node delegator
+        // necessary to make the situation work.
+        vm.prank(manager);
+        lrtDepositPoolP.transferAssetToNodeDelegator(0, address(cbETH), amount);
+
+        console2.log("Deposit Amount: %s", amount);
+        uint256 tokenToRSETHAmount = lrtDepositPoolP.getRsETHAmountToMint(address(cbETH), amount);
+        console2.log("Amount of RSETH Tokens to Recieve: %s", tokenToRSETHAmount);
+
+        // depositing again to check how many we will receive
+        amountOfRSETHMintedToAlice = depositAssetToPool(address(cbETH), amount, alice, 2);
+        console2.log("Amount of token Received After Deposit: %s", amountOfRSETHMintedToAlice);
+
+        // can't do this because of another vulnerability in the code
+        // assertEq(amountOfRSETHMintedToAlice, tokenToRSETHAmount, "amount is not same");
+    }
+```
+
+*Output:*
+
+```bash
+Running 1 test for test/Integration.t.sol:BaseIntegrationTest
+[PASS] test_SameTestAsAboveWithoutAddingDuplicateNodeDelegator() (gas: 505533)
+Logs:
+
+
+  ------------------------ Run 1:  Deposit Info  ------------------------
+
+  Deposit Amount: 500000000000000000000
+  LRTDepositPool Balance Before Deposit: 0
+  LRTDepositPool Balance After Deposit: 500000000000000000000
+  Change in Balance of LRTDepositPool: 500000000000000000000
+  RSETH Minted to User: 500000000000000000000
+  TotalSupply of RSETH: 500000000000000000000
+
+  ------------------------------------------------------------------------
+
+  Deposit Amount: 500000000000000000000
+  Amount of RSETH Tokens to Recieve: 500000000000000000000
+
+
+  ------------------------ Run 2:  Deposit Info  ------------------------
+
+  Deposit Amount: 500000000000000000000
+  LRTDepositPool Balance Before Deposit: 0
+  LRTDepositPool Balance After Deposit: 500000000000000000000
+  Change in Balance of LRTDepositPool: 500000000000000000000
+  RSETH Minted to User: 250000000000000000000
+  TotalSupply of RSETH: 750000000000000000000
+
+  ------------------------------------------------------------------------
+
+  Amount of token Received After Deposit: 250000000000000000000
+
+Test result: ok. 1 passed; 0 failed; 0 skipped; finished in 6.28ms
+
+Ran 1 test suites: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+PS E:\kelp-audit> 
+```
+
+As you can see when duplicate address is there the amount of token received was `250000000000000000000` which reduced to `166666666666666666666` when there was a duplicate for the same amount of tokens.
+
+## Tools Used
+
+## Recommended Mitigation Steps

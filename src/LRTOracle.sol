@@ -44,8 +44,6 @@ contract LRTOracle is ILRTOracle, LRTConfigRoleChecker, PausableUpgradeable {
     /// @param asset the asset for which exchange rate is required
     /// @return assetPrice exchange rate of asset
     function getAssetPrice(address asset) public view onlySupportedAsset(asset) returns (uint256) {
-        console2.log("hello form getAsse");
-
         return IPriceFetcher(assetPriceOracle[asset]).getAssetPrice(asset);
     }
 
@@ -66,7 +64,6 @@ contract LRTOracle is ILRTOracle, LRTConfigRoleChecker, PausableUpgradeable {
         address[] memory supportedAssets = lrtConfig.getSupportedAssetList();
         uint256 supportedAssetCount = supportedAssets.length;
 
-        console2.log("hello");
         for (uint16 asset_idx; asset_idx < supportedAssetCount;) {
             address asset = supportedAssets[asset_idx];
             uint256 assetER = getAssetPrice(asset);

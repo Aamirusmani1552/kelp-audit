@@ -7,6 +7,7 @@ import { ILRTConfig } from "./interfaces/ILRTConfig.sol";
 
 import { AccessControlUpgradeable } from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import { console2 } from "forge-std/console2.sol";
 
 /// @title LRTConfig - LRT Config Contract
 /// @notice Handles LRT configuration
@@ -14,7 +15,7 @@ import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils
 contract LRTConfig is ILRTConfig, AccessControlUpgradeable {
     mapping(bytes32 tokenKey => address tokenAddress) public tokenMap;
     mapping(bytes32 contractKey => address contractAddress) public contractMap;
-    // @audit why two mappings is required for supported token?
+
     mapping(address token => bool isSupported) public isSupportedAsset;
     mapping(address token => uint256 amount) public depositLimitByAsset;
     // @audit why is this override?
