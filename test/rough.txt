@@ -86,13 +86,96 @@ This is a potential issue as the user will get less rsETH than expected.
 // @audit what about erc777 tokens? would they work 
 
 
-There is no check in `LRTDepositPool::addNodeDelegatorContractToQueue(...)` that checks for the duplicate address of the `NodeDelegator`. If same address is added more than once then the price oracles and corresponding functions will give wrong price info and less tokens will be minted to the user because of double calculation of the deposited Amount.
+The calculation for amount of `RSETH` to be minted to the user for the deposit made depends upon the balances of different tokens deposited in the `LRTDepositPool`, `NodeDelegator` and `EigenLayer` strategies. But for the calculation of these deposit it uses `IERC20(asset).balanceOf(address(this))`. This simply means the amount of tokens that these contracts has not the actual amount deposited by the user. Now anyone can transfer the `asset` directly to the contracts and completely mess up the calculation which will result in less tokens to be minted to the users.
+
 
 ## Impact
-`LRTDepositPool::addNodeDelegatorContractToQueue(...)` function does not check if the already added `NodeDelegator` address has been sent to the function. If the same address is sent mistakenly then it will be added to the node delegator queue. And there is no way now to remove this duplicate address from the queue. 
-This delegator queue directly affects the calculation of tokens to mint. This is how:
 
-When user calls `LRTDepositPool::depositAsset(...)` function, this function makes a call to `LRTDepositPool::_mintRsETH(...)` function. This function mints the amount of `RSETH` that user should receive for his deposit. To calculate the amount of `RSETH` to mint, this function calls `LRTDepositPool::getRsETHAmountToMint(...)`. Then a call will be made to `LRTOracle::getRSETHPrice()` to get the `RSETH` price for further calculation:
+The `LRTDepositPool::depositAsset(...))` function uses `LRTDepositPool::_mintRsETH(...)` function to calculate the amount of `RSETH` to be minted to the user. Here is a high level flow of the calls for the function:
+
+```
+LRTDepositPool::deposit()
+           |_ LRTDepositPool::_mintRsETH() 
+                      |_ LRTDepositPool::getRsETHAmountToMint() 
+                                |_ LRTOracle::getAssetPrice()
+                                |_ LRTOracle::getRSETHPrice()
+                                            |_ LRTOracle::getSupportedAssetList()
+                                            |_ LRTOracle::getAssetPrice()
+                                            |_ LRTDepositPool::getTotalAssetDeposits()
+@>                                                          |_ LRTDepositPool::getAssetDistributionData()
+                                                                   |_ NodeDelegator::getAssetBalance()
+```
+
+When the call reaches to `LRTDepositPool::getAssetDistributionData()`, this function does the following calculation to check the total deposits made by the user:
+
+```Javascript
+    function getAssetDistributionData(address asset)
+        public
+        view
+        override
+        onlySupportedAsset(asset)
+        returns (uint256 assetLyingInDepositPool, uint256 assetLyingInNDCs, uint256 assetStakedInEigenLayer)
+    {
+        // Question: is here the right place to have this? Could it be in LRTConfig?
+@>        assetLyingInDepositPool = IERC20(asset).balanceOf(address(this));
+
+        uint256 ndcsCount = nodeDelegatorQueue.length;
+        for (uint256 i; i < ndcsCount;) {
+@>            assetLyingInNDCs += IERC20(asset).balanceOf(nodeDelegatorQueue[i]);
+            assetStakedInEigenLayer += INodeDelegator(nodeDelegatorQueue[i]).getAssetBalance(asset);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+```
+
+It just uses `IERC20(asset).balanceOf(address(this))` to get the balances stored in the contracts. But this balance doesn't mean that the balance returned is the actual deposit made. It is just the amount of token the contract hold. Now anybody can come and mess this calculation up by transferring `LRTDepositPool` and `NodeDelegator` some tokens directly without going through the `LRTDepositPool::deposit(...)`. Because of this transfer there will be no corresponding `RSETH` minted and the amount of tokens stored in the contract will be increased. So `assetLyingInDepositPool` and `assetLyingInNDCs` will return incorrect deposit data because of the amount transferred. 
+Now when this amount is returned back to the caller function that is `LRTDepositPool::getTotalAssetDeposits(...)` it will be combined together and returned back to `LRTOracle::getRSETHPrice()` function:
+
+```Javascript
+    function getTotalAssetDeposits(address asset) public view override returns (uint256 totalAssetDeposit) {
+        (uint256 assetLyingInDepositPool, uint256 assetLyingInNDCs, uint256 assetStakedInEigenLayer) =
+            getAssetDistributionData(asset);
+@>        return (assetLyingInDepositPool + assetLyingInNDCs + assetStakedInEigenLayer);
+    }
+```
+
+When this amount is received by `LRTOracle::getRSETHPrice()`, it will multiply the amount will it's corresponding ETH conversion price. And will store it in `totalETHInPool`. Since the wrong info was returned from the previous function, the amount stored in `totalETHInPool` will be wrong(will be more if we say more precisely) as well.
+
+```Javascript
+    function getRSETHPrice() external view returns (uint256 rsETHPrice) {
+        address rsETHTokenAddress = lrtConfig.rsETH();
+        uint256 rsEthSupply = IRSETH(rsETHTokenAddress).totalSupply();
+
+        if (rsEthSupply == 0) {
+            return 1 ether;
+        }
+
+        uint256 totalETHInPool;
+        address lrtDepositPoolAddr = lrtConfig.getContract(LRTConstants.LRT_DEPOSIT_POOL);
+
+        address[] memory supportedAssets = lrtConfig.getSupportedAssetList();
+        uint256 supportedAssetCount = supportedAssets.length;
+
+        for (uint16 asset_idx; asset_idx < supportedAssetCount;) {
+            address asset = supportedAssets[asset_idx];
+            uint256 assetER = getAssetPrice(asset);
+
+>@            uint256 totalAssetAmt = ILRTDepositPool(lrtDepositPoolAddr).getTotalAssetDeposits(asset);
+            totalETHInPool += totalAssetAmt * assetER;
+
+            unchecked {
+                ++asset_idx;
+            }
+        }
+        // @audit can we manipulate the price and get more rsEth? or can we manipulate the price and make the rsEth more
+        // expensive?
+        return totalETHInPool / rsEthSupply;
+    }
+```
+
+And in the end this `totalETHInPool` is used to return the ratio of total Eth deposited to total `RSETH` supply. Or we can say for a single `RSETH` minted, how much `ETH`(or token in terms of eth) is deposited. since `totalETHInPool` holds more amount than the actual, the ratio returned will be more than the actual ratio. Now this ratio will be returned back to `LRTDepositPool::getRsETHAmountToMint()` and it will perform the following calculation:
 
 ```Javascript
     function getRsETHAmountToMint(
@@ -113,9 +196,36 @@ When user calls `LRTDepositPool::depositAsset(...)` function, this function make
 
 @>        rsethAmountToMint = (amount * lrtOracle.getAssetPrice(asset)) / lrtOracle.getRSETHPrice();
     }
+
 ```
 
-This function again takes help of few other function to make the calculation. This is the function that will cause the problem:
+As you can see `lrtOracle::getRSETHPrice(...)` is in the denominator, that means bigger of the value returned from the function the lesser will be `rsethAmountToMint` which is the actual amount of `RSETH` tokens that user will be get. And that is the case in this situation. That means the amount of tokens will be minted to the user will be less than it should be. Hence user will be in loss.
+
+Now this is not it, this problem will become even bigger if the amount transferred to `NodeDelegator` or `LRTDepositPool` is transferred to `EigenLayer` strategy. Because then we will not have any control of it in our hand. So that mean's this extra deposit made by the user should not be transferred to `EigenLayer` strategy. But that is not what's happening in the contracts. Here is a function that deposit asset in `EigenLayer`:
+
+```Javascript
+    function depositAssetIntoStrategy(address asset)
+        external
+        override
+        whenNotPaused
+        nonReentrant
+        onlySupportedAsset(asset)
+        onlyLRTManager
+    {
+        address strategy = lrtConfig.assetStrategy(asset);
+        IERC20 token = IERC20(asset);
+        address eigenlayerStrategyManagerAddress = lrtConfig.getContract(LRTConstants.EIGEN_STRATEGY_MANAGER);
+
+@>        uint256 balance = token.balanceOf(address(this));
+
+        emit AssetDepositIntoStrategy(asset, strategy, balance);
+
+@>        IEigenStrategyManager(eigenlayerStrategyManagerAddress).depositIntoStrategy(IStrategy(strategy), token, balance);
+    }
+```
+
+As you can see, this also has the same issue that we talked earlier. This will also read the amount of token to be transferred to the strategy based on the same calculation `token.balanceOf(address(this))`. That mean's this will transfer all amount of tokens that is stored in the contracts and the following line of code will also fetch the wrong balance in `LRTDepositPool::getAssetDistributionData(...)` that we cannot even change as it only reads the amount of tokens deposited in the strategy from the strategy itself by using `NodeDelegator::getAssetBalance(...)` function:
+
 
 ```Javascript
     function getAssetDistributionData(address asset)
@@ -128,10 +238,10 @@ This function again takes help of few other function to make the calculation. Th
         // Question: is here the right place to have this? Could it be in LRTConfig?
         assetLyingInDepositPool = IERC20(asset).balanceOf(address(this));
 
-@>        uint256 ndcsCount = nodeDelegatorQueue.length;
+        uint256 ndcsCount = nodeDelegatorQueue.length;
         for (uint256 i; i < ndcsCount;) {
             assetLyingInNDCs += IERC20(asset).balanceOf(nodeDelegatorQueue[i]);
-            assetStakedInEigenLayer += INodeDelegator(nodeDelegatorQueue[i]).getAssetBalance(asset);
+@>            assetStakedInEigenLayer += INodeDelegator(nodeDelegatorQueue[i]).getAssetBalance(asset);
             unchecked {
                 ++i;
             }
@@ -139,332 +249,8 @@ This function again takes help of few other function to make the calculation. Th
     }
 ```
 
-This `LRTDepositPool::getAssetDistributionData(...)` fucntion as you can see counts the amount of assets deposited in both `NodeDelegator` contracts and `Eigen Layer Strategies`. It first fetches the `nodeDelegatorQueue` and try looping through each `NodeDelegator` contract to get the amount of tokens deposited and adds it to `assetLyingInNDCs` and `assetStakedInEigenLayer`. But if there is a duplicate address in the queue then the same deposit value will be added twice and returned value will be more than the original.
-
-Now when this amount is returned back to the `LRTOracle::getRSETHPrice(...)` after some other calculation by other functions, the combined amount returned will be multiplied by it's corresponding ETH price and will be added to `totalETHInPool`. 
-
-```Javascript
-    function getRSETHPrice() external view returns (uint256 rsETHPrice) {
-        address rsETHTokenAddress = lrtConfig.rsETH();
-        uint256 rsEthSupply = IRSETH(rsETHTokenAddress).totalSupply();
-
-        if (rsEthSupply == 0) {
-            return 1 ether;
-        }
-
-        uint256 totalETHInPool;
-        address lrtDepositPoolAddr = lrtConfig.getContract(LRTConstants.LRT_DEPOSIT_POOL);
-
-        address[] memory supportedAssets = lrtConfig.getSupportedAssetList();
-        uint256 supportedAssetCount = supportedAssets.length;
-
-        for (uint16 asset_idx; asset_idx < supportedAssetCount;) {
-            address asset = supportedAssets[asset_idx];
-            uint256 assetER = getAssetPrice(asset);
-
-            uint256 totalAssetAmt = ILRTDepositPool(lrtDepositPoolAddr).getTotalAssetDeposits(asset);
- @>           totalETHInPool += totalAssetAmt * assetER;
-
-            unchecked {
-                ++asset_idx;
-            }
-        }
-        // @audit can we manipulate the price and get more rsEth? or can we manipulate the price and make the rsEth more
-        // expensive?
-        return totalETHInPool / rsEthSupply;
-    }
-```
-
-Now this `totalETHInPool` variables hold wrong data that is more than the orginal. When this function reaches to return statement it will return wrong ratio. And this ratio will be returned back to `LRTDepositPool::getRsETHAmountToMint(...)`
-
-```Javascript
-        return totalETHInPool / rsEthSupply;
-```
-
-`LRTDepositPool::getRsETHAmountToMint(...)` function performs the following calculation to calculate the amount of RSETH to mint:
-
-```Javascript
-        rsethAmountToMint = (amount * lrtOracle.getAssetPrice(asset)) / lrtOracle.getRSETHPrice();
-```
-
-since the value returned from the `LRTOracle::getRSETHPrice(...)` is in the denominator, the amount to mint will be less as the price is more than the original. For example:
-
-```
-amount = 10 cbETH
-cbETHPrice = 1 ETH (denoted by `lrtOracle.getAssetPrice(asset)` in the above calculation)
-rsETHPrice = 1 ETH (denoted by `lrtOracle.getRSETHPrice()` in the above calculation)
-
-rsethAmountToMint  = 10e18 * 1e18 / 1e18
-                   = 10e18
-
---> When rsETHPrice = 1.1 ETH
-rsethAmountToMint  = 10e18 * 1e18 / 1.1e18
-                   = 9.09e18 approx
-```
-
-Hence the wrong info will be returned to the mint function and user will receive less tokens.
-
-## Proof of Concept
-#### Tests that proves that:
-
-_When Duplicate `NodeDelegator` has been added_
-
-```Javascript
-    function test_SameNodeDelegatorsCanBeAddedTwiceThatWillGiveIncorrectData() public {
-        // adding some tokens to the pool
-        uint256 amount = 500 ether;
-        vm.prank(alice);
-        uint256 amountOfRSETHMintedToAlice = depositAssetToPool(address(cbETH), amount, alice, 1);
-
-        // transferring rewards to node delegator
-        // necessary to make the situation work.
-        vm.prank(manager);
-        lrtDepositPoolP.transferAssetToNodeDelegator(0, address(cbETH), amount);
-
-        // adding same node delegator again
-        address[] memory nodeDelegatorAddresses = new address[](1);
-        nodeDelegatorAddresses[0] = address(nodeDelP);
-
-        vm.startPrank(admin);
-        lrtDepositPoolP.addNodeDelegatorContractToQueue(nodeDelegatorAddresses);
-        vm.stopPrank();
-
-        // checking if node delegator is added
-        address[] memory addedAddresses = lrtDepositPoolP.getNodeDelegatorQueue();
-        assertEq(addedAddresses.length, 2, "length is not same");
-
-        // checking if node delegator addresses are same
-        for (uint8 i; i < addedAddresses.length; i++) {
-            assertEq(addedAddresses[i], address(nodeDelP), "addresses are not same");
-        }
-
-        console2.log("Amount To Deposit: %s", amount);
-        uint256 tokenToRSETHAmount = lrtDepositPoolP.getRsETHAmountToMint(address(cbETH), amount);
-        console2.log("Amount of RSETH Tokens to Recieve: %s", tokenToRSETHAmount);
-
-        // depositing again to check how many we will receive
-        amountOfRSETHMintedToAlice = depositAssetToPool(address(cbETH), amount, alice, 2);
-        console2.log("Amount of token Received After Deposit: %s", amountOfRSETHMintedToAlice);
-
-        // can't do this because of another vulnerability in the code
-        // assertEq(amountOfRSETHMintedToAlice, tokenToRSETHAmount, "amount is not same");
-    }
-```
-
-*Output:*
-
-```bash
-[PASS] test_SameNodeDelegatorsCanBeAddedTwiceThatWillGiveIncorrectData() (gas: 588582)
-Logs:
-
-
-  ------------------------ Run 1:  Deposit Info  ------------------------
-
-  Deposit Amount: 500000000000000000000
-  LRTDepositPool Balance Before Deposit: 0
-  LRTDepositPool Balance After Deposit: 500000000000000000000
-  Change in Balance of LRTDepositPool: 500000000000000000000
-  RSETH Minted to User: 500000000000000000000
-  TotalSupply of RSETH: 500000000000000000000
-
-  ------------------------------------------------------------------------
-
-  Amount To Deposit: 500000000000000000000
-  Amount of RSETH Tokens to Recieve: 250000000000000000000
-
-
-  ------------------------ Run 2:  Deposit Info  ------------------------
-
-  Deposit Amount: 500000000000000000000
-  LRTDepositPool Balance Before Deposit: 0
-  LRTDepositPool Balance After Deposit: 500000000000000000000
-  Change in Balance of LRTDepositPool: 500000000000000000000
-  RSETH Minted to User: 166666666666666666666
-  TotalSupply of RSETH: 666666666666666666666
-
-  ------------------------------------------------------------------------
-
-  Amount of token Received After Deposit: 166666666666666666666
-
-Test result: ok. 1 passed; 0 failed; 0 skipped; finished in 8.15ms
-
-Ran 1 test suites: 1 tests passed, 0 failed, 0 skipped (1 total tests)
-PS E:\kelp-audit> 
-
-```
-
-_When no Duplicate `NodeDelegator` is added_
-
-```Javascript
-    function test_SameTestAsAboveWithoutAddingDuplicateNodeDelegator() public {
-        // adding some tokens to the pool
-        uint256 amount = 500 ether;
-        vm.prank(alice);
-        uint256 amountOfRSETHMintedToAlice = depositAssetToPool(address(cbETH), amount, alice, 1);
-
-        // transferring rewards to node delegator
-        // necessary to make the situation work.
-        vm.prank(manager);
-        lrtDepositPoolP.transferAssetToNodeDelegator(0, address(cbETH), amount);
-
-        console2.log("Deposit Amount: %s", amount);
-        uint256 tokenToRSETHAmount = lrtDepositPoolP.getRsETHAmountToMint(address(cbETH), amount);
-        console2.log("Amount of RSETH Tokens to Recieve: %s", tokenToRSETHAmount);
-
-        // depositing again to check how many we will receive
-        amountOfRSETHMintedToAlice = depositAssetToPool(address(cbETH), amount, alice, 2);
-        console2.log("Amount of token Received After Deposit: %s", amountOfRSETHMintedToAlice);
-
-        // can't do this because of another vulnerability in the code
-        // assertEq(amountOfRSETHMintedToAlice, tokenToRSETHAmount, "amount is not same");
-    }
-```
-
-*Output:*
-
-```bash
-Running 1 test for test/Integration.t.sol:BaseIntegrationTest
-[PASS] test_SameTestAsAboveWithoutAddingDuplicateNodeDelegator() (gas: 505533)
-Logs:
-
-
-  ------------------------ Run 1:  Deposit Info  ------------------------
-
-  Deposit Amount: 500000000000000000000
-  LRTDepositPool Balance Before Deposit: 0
-  LRTDepositPool Balance After Deposit: 500000000000000000000
-  Change in Balance of LRTDepositPool: 500000000000000000000
-  RSETH Minted to User: 500000000000000000000
-  TotalSupply of RSETH: 500000000000000000000
-
-  ------------------------------------------------------------------------
-
-  Deposit Amount: 500000000000000000000
-  Amount of RSETH Tokens to Recieve: 500000000000000000000
-
-
-  ------------------------ Run 2:  Deposit Info  ------------------------
-
-  Deposit Amount: 500000000000000000000
-  LRTDepositPool Balance Before Deposit: 0
-  LRTDepositPool Balance After Deposit: 500000000000000000000
-  Change in Balance of LRTDepositPool: 500000000000000000000
-  RSETH Minted to User: 250000000000000000000
-  TotalSupply of RSETH: 750000000000000000000
-
-  ------------------------------------------------------------------------
-
-  Amount of token Received After Deposit: 250000000000000000000
-
-Test result: ok. 1 passed; 0 failed; 0 skipped; finished in 6.28ms
-
-Ran 1 test suites: 1 tests passed, 0 failed, 0 skipped (1 total tests)
-PS E:\kelp-audit> 
-```
-
-As you can see when duplicate address is there the amount of token received was `250000000000000000000` which reduced to `166666666666666666666` when there was a duplicate for the same amount of tokens.
-
-## Tools Used
-
-## Recommended Mitigation Steps
-
-Users will receive less `RSETH` tokens when depositing into the contract using `LRTDepositPool::deposit(...)`. The function transfers the deposit tokens to itself and then makes calculation for the amount of `RSETH` to be minted for the user. Because of this the users will get less tokens then actual amount.
-
-## Impact
-The `LRTDepositPool::deposit(...)` function makes call to different functions from the same contract that again calls other contracts to calculate the amount of token to mint for the user. Here is a high level flow:
-
-```
-LRTDepositPool::deposit()
-           |_ LRTDepositPool::_mintRsETH() 
-                      |_ LRTDepositPool::getRsETHAmountToMint() 
-                                |_ LRTOracle::getAssetPrice()
-                                |_ LRTOracle::getRSETHPrice()
-                                            |_ LRTOracle::getSupportedAssetList()
-                                            |_ LRTOracle::getAssetPrice()
-                                            |_ LRTDepositPool::getTotalAssetDeposits()
-@>                                                          |_ LRTDepositPool::getAssetDistributionData()
-                                                                   |_ NodeDelegator::getAssetBalance()
-```
-
-This function makes a call to `LRTDepositPool::getAssetDistributionData()`(indirectly) to fetch the total amount of tokens deposited in `LRTDepositPool`, `NodeDelegator` and Eigen Layer strategies. To fetch the assets deposited in `LRTDepositPool` this `LRTDepositPool::getAssetDistributionData()` function perform the following operation:
-
-```Javascript
-        assetLyingInDepositPool = IERC20(asset).balanceOf(address(this));
-```
-
-This just reads the balance of the `asset` that `LRTDepositPool` has. Now the problem is, when user calls `LRTDepositPool::deposit()`, this function first transfer the tokens to itself and then calls `_mintRsETH()` to calculate the amount of `RSETH` to mint to the user. 
-
-```Javascript
-    function depositAsset(
-        address asset,
-        uint256 depositAmount
-    )
-        external
-        whenNotPaused
-        nonReentrant
-        onlySupportedAsset(asset)
-    {
-        // checks
-        if (depositAmount == 0) {
-            revert InvalidAmount();
-        }
-        if (depositAmount > getAssetCurrentLimit(asset)) {
-            revert MaximumDepositLimitReached();
-        }
-
-        // this will increase the balance before any calculation
-@>        if (!IERC20(asset).transferFrom(msg.sender, address(this), depositAmount)) {
-            revert TokenTransferFailed();
-        }
-
-        // interactions
-@>        uint256 rsethAmountMinted = _mintRsETH(asset, depositAmount);
-
-        emit AssetDeposit(asset, depositAmount, rsethAmountMinted);
-    }
- ```
-
-But when a call reaches to `LRTDepositPool::getAssetDistributionData()`, the function calculate the `assetLyingInDepositPool` using the above operation that just reads the balance of token that is stored in `LRTDepositPool` using `ERC20::balanceOf()` function. But this balance now also stores the newly added tokens as they were transferred to this contract in the beginning. That means the data in `assetLyingInDepositPool` will be more than the original amount. 
-This amount will be returned back to `LRTOracle::getRSETHPrice()` after going through some other functions that will add this amount to balance of `token` stored in `NodeDelegator` and Eigen Layer strategies.
-
-```Javascript
-    function getRSETHPrice() external view returns (uint256 rsETHPrice) {
-        address rsETHTokenAddress = lrtConfig.rsETH();
-        uint256 rsEthSupply = IRSETH(rsETHTokenAddress).totalSupply();
-
-        if (rsEthSupply == 0) {
-            return 1 ether;
-        }
-
-        uint256 totalETHInPool;
-        address lrtDepositPoolAddr = lrtConfig.getContract(LRTConstants.LRT_DEPOSIT_POOL);
-
-        address[] memory supportedAssets = lrtConfig.getSupportedAssetList();
-        uint256 supportedAssetCount = supportedAssets.length;
-
-        for (uint16 asset_idx; asset_idx < supportedAssetCount;) {
-            address asset = supportedAssets[asset_idx];
-            uint256 assetER = getAssetPrice(asset);
-
-@>            uint256 totalAssetAmt = ILRTDepositPool(lrtDepositPoolAddr).getTotalAssetDeposits(asset);
-            totalETHInPool += totalAssetAmt * assetER;
-
-            unchecked {
-                ++asset_idx;
-            }
-        }
-
-        // expensive?
-        return totalETHInPool / rsEthSupply;
-    }
-```
-
-This `totalAssetAmt` contains all amount of a token that is stored in different contracts that also includes the newly deposited amount. Then this amount will be multiplied with corresponding ETH price feed and will be stored in `totalETHInPool`. Now when the `RSETH` price is returned from the function it will be in ration of total eth deposited in pools to total supply of `RSETH`. And since the `RSETH` supply will be less than the total deposits of eth stored in `totalETHInPool` because the corresponding `RSETH` has not been minted yet. the ratio returned will be more than expected. This ratio will increase if the `amount` provided to `LRTDepositPool::deposit(...)` is increased.
-
-Now this ratio will be returned to the `LRTDepositPool::getRsETHAmountToMint()` 
-
- The amount that `LRTOracle::getRSETHPrice()`
-This data will be returned back to `LRTDepositPool::getRsETHAmountToMint()` function that will calculate the amount of `RSETH` token to mint. 
+Now the amount of assets returned will always be more than the corresponding `RSETH` minted and the ratio will go high and the calculation will calculate less tokens to be minted for the user.
+ 
 
 ## Proof of Concept
 Provide direct links to all referenced code in GitHub. Add screenshots, logs, or any other relevant proof that illustrates the concept.

