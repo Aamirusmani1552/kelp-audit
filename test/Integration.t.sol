@@ -370,6 +370,25 @@ contract BaseIntegrationTest is BaseTest {
         }
     }
 
+    function test_depositToPoolMultipleTimesDifferentAmount() public {
+        uint256 amount = 500 ether;
+        uint256 amount2 = 20_000 ether;
+
+        // minting tokens to user to make sure he has enough tokens
+        cbETH.mint(alice, amount + amount2);
+
+        uint256 userBalanceBefore = IERC20(cbETH).balanceOf(alice);
+        (uint256 rsEthMinted) = depositAssetToPool(address(cbETH), amount, alice, 1);
+        uint256 userBalanceAfter = IERC20(cbETH).balanceOf(alice);
+        assertEq(userBalanceBefore - userBalanceAfter, amount, "amount is not same");
+
+        userBalanceBefore = IERC20(cbETH).balanceOf(alice);
+        (rsEthMinted) = depositAssetToPool(address(cbETH), amount2, alice, 2);
+        userBalanceAfter = IERC20(cbETH).balanceOf(alice);
+
+        assertEq(userBalanceBefore - userBalanceAfter, amount2, "amount is not same");
+    }
+
     function testFuzz_depositToPool(uint256 amount) public {
         vm.assume(amount > 0 && amount < 100_000_000_000 ether);
 
