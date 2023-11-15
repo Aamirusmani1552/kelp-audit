@@ -74,7 +74,7 @@ contract MockStrategy {
     }
 }
 
-contract MockUSDC is ERC20 {
+contract MockLST is ERC20 {
     constructor(string memory name, string memory symbol) ERC20(name, symbol) { }
 
     function mint(address to, uint256 amount) external {
@@ -82,13 +82,28 @@ contract MockUSDC is ERC20 {
     }
 
     function decimals() public view virtual override returns (uint8) {
-        return 6;
+        return 18;
     }
 }
 
 contract MockPriceAggregator {
-    function latestAnswer() external pure returns (uint256) {
-        return 1 ether;
+    uint256 public price;
+    uint256 public decimals = 1e18;
+
+    function latestAnswer() external view returns (uint256) {
+        return 1 * decimals;
+    }
+
+    // this function is just a mock that is not present in the original chainlink aggregator. it
+    // is created just to test the code in different conditions
+    function updatePrice(uint256 newPrice) external {
+        price = newPrice * decimals;
+    }
+
+    // this function is just a mock that is not present in the original chainlink aggregator. it
+    // is created just to test the code in different conditions
+    function updateDecimals(uint256 newDecimals) external {
+        decimals = newDecimals;
     }
 }
 
@@ -124,7 +139,7 @@ contract BaseIntegrationTest is BaseTest {
     MockStrategy public rETHMockStrategy;
     MockStrategy public cbETHMockStrategy;
     MockStrategy public stETHMockStrategy;
-    MockUSDC public usdc;
+    MockLST public mLst;
     address public mockLRTDepositPool;
     uint256 public mockUserUnderlyingViewBalance;
 
@@ -141,7 +156,7 @@ contract BaseIntegrationTest is BaseTest {
         lrtOracle = new LRTOracle();
         rsETH = new RSETH();
         lrtDepositPool = new LRTDepositPool();
-        usdc = new MockUSDC("USDC", "USDC");
+        mLst = new MockLST("MockLST", "MLST");
         nodeDel = new NodeDelegator();
         chainlinkPriceOracle = new ChainlinkPriceOracle();
         mockPriceAggregator = new MockPriceAggregator();
@@ -183,10 +198,10 @@ contract BaseIntegrationTest is BaseTest {
             ""
         );
 
-        // minting usdc to users: 100k each
-        usdc.mint(alice, 100_000 ether);
-        usdc.mint(bob, 100_000 ether);
-        usdc.mint(carol, 100_000 ether);
+        // minting new LST to users: 100k each
+        mLst.mint(alice, 100_000 ether);
+        mLst.mint(bob, 100_000 ether);
+        mLst.mint(carol, 100_000 ether);
 
         // converting different proxies
         lrtConfigP = LRTConfig(address(lrtConfigProxy));
@@ -274,7 +289,7 @@ contract BaseIntegrationTest is BaseTest {
             vm.label(address(rETHMockStrategy), "rETHMockStrategy");
             vm.label(address(cbETHMockStrategy), "cbETHMockStrategy");
             vm.label(address(stETHMockStrategy), "stETHMockStrategy");
-            vm.label(address(usdc), "usdc");
+            vm.label(address(mLst), "mockLST");
             vm.label(address(cbETH), "cbETH");
             vm.label(address(rETH), "rETH");
             vm.label(address(stETH), "stETH");
@@ -446,6 +461,49 @@ contract BaseIntegrationTest is BaseTest {
         console2.log("> Getting RSETH Amount to be Minted After the direct token deposit of %s amount:", amount);
         console2.log("\tAmount To Deposit: %s", amount);
         console2.log("\tAmount of RSETH Tokens to Recieve: %s", rsEthMintedForAmount);
+    }
+
+    // @audit potential issue
+    function test_ProtocolWillNotWorkWithChainlinkPriceFeedsWithDifferentDecimalValues() public {
+        // adding new LSToken
+        addNewLST();
+
+        uint256 amount = 500 ether;
+        // updating decimals of the mock price aggregator.
+        // this is not possible to do in original price aggregator. It's just a mock funciton to
+        // simulate the condition. This stil represents 1 ETH : 1 LST
+        mockPriceAggregator.updateDecimals(1e8);
+
+        // checking if the decimals are updated
+        assertEq(mockPriceAggregator.decimals(), 1e8, "decimals are not same");
+
+        // getting the RSETH amount to be minted for `amount` of tokens
+        // the actual amount minted will be less than `rsEthMintedForAmount` because there is
+        // another bug in the code that will make the amount less than `rsEthMintedForAmount`
+        uint256 rsEthMintedForAmount = lrtDepositPoolP.getRsETHAmountToMint(address(mLst), amount);
+
+        console2.log("> Details for the Amount to be Mint for LST deposit");
+        console2.log("\tAmount To Deposit: %s", amount);
+        console2.log("\tAmount of RSETH Tokens to Recieve: %s\n", rsEthMintedForAmount);
+    }
+
+    function addNewLST() public {
+        // adding new LST
+        vm.startPrank(manager);
+        lrtConfigP.addNewSupportedAsset(address(mLst), 100_000 ether);
+        vm.stopPrank();
+
+        vm.startPrank(admin);
+        MockStrategy newLSTStrategy = new MockStrategy(address(mLst), mockUserUnderlyingViewBalance);
+        lrtConfigP.updateAssetStrategy(address(mLst), address(newLSTStrategy));
+        vm.stopPrank();
+
+        vm.startPrank(manager);
+        chainlinkPriceOracleP.updatePriceFeedFor(address(mLst), address(mockPriceAggregator));
+
+        // setting up oracle for the tokens
+        lrtOracleP.updatePriceOracleFor(address(mLst), address(chainlinkPriceOracleP));
+        vm.stopPrank();
     }
 
     function depositAssetToPool(
